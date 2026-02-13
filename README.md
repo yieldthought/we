@@ -1,4 +1,4 @@
-`we`: a weight explorer for Hugging Face models that avoids downloading too much:
+`we` - a weight explorer for Hugging Face models that avoids downloading too much:
 
 <p align="center">
   <img src="docs/assets/deepseek_example.png" alt="Screenshot of we listing DeepSeek-R1 tensors" width="542" />
