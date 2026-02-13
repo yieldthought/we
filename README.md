@@ -3,7 +3,7 @@
 `we` is a small, terminal-first model weight viewer for Hugging Face checkpoints.
 
 <p align="center">
-  <img src="docs/assets/deepseek_example.png" alt="Screenshot of we listing DeepSeek-R1 tensors" width="545" />
+  <img src="docs/assets/deepseek_example.png" alt="Screenshot of we listing DeepSeek-R1 tensors" width="542" />
 </p>
 
 Today it focuses on model introspection. Next steps are compression experiments (TTNN `bfp8`/`bfp4`/`bfp2`) and quality metrics (`pcc`, `rtol`, `atol`) against original weights.
