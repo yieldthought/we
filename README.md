@@ -4,7 +4,7 @@
   <img src="docs/assets/deepseek_example.png" alt="Screenshot of we listing DeepSeek-R1 tensors" width="542" />
 </p>
 
-Today it focuses on model introspection. Next steps are compression experiments (TTNN `bfp8`/`bfp4`/`bfp2`) and quality metrics (`pcc`, `rtol`, `atol`) against original weights.
+Today it focuses on model introspection. Next steps are compression experiments (TTNN `bfp8`/`bfp4`/`bfp2`) and quality metrics (`pcc`, `atol`) against original weights.
 
 ## Quick Start
 
@@ -23,7 +23,7 @@ Run the tool:
 ## Usage
 
 ```bash
-we [repo_or_url] [filter_query] [--revision REVISION]
+we [repo_or_url] [filter_query] [--revision REVISION] [-c bfp8]
 ```
 
 Examples:
@@ -41,8 +41,14 @@ Examples:
 # URL input also works
 ./we https://huggingface.co/Qwen/Qwen3-0.6B/tree/main
 
+# Local model folder or file path also works
+./we /path/to/local/model_dir model.layers.1
+
 # Specific branch/tag/commit
 ./we Qwen/Qwen3-0.6B --revision main
+
+# Run host-side bfp8 round-trip + quality metrics on matched tensors
+./we Qwen/Qwen3-0.6B model.layers.1.self_attn -c bfp8
 ```
 
 ## Output Notes
@@ -51,6 +57,8 @@ Examples:
 - Mixed structures (for example early dense layers then MoE layers) collapse by contiguous matching runs.
 - F8 pair pattern (`weight` + `weight_scale_inv`) is rendered as a single logical row and hides `weight_scale_inv`.
 - Percentages account for collapsed multiplicity (so `%` reflects true total contribution).
+- `-c bfp8` adds ` | <min> ≤ <mean> ≤ <max> | bfp8  <pcc> pcc <atol> atol` after the size/% columns.
+- Compression only downloads the shard files that contain matched tensors (file-level granularity, via HF cache).
 
 ## Caching
 

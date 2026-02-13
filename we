@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import struct
@@ -14,8 +15,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from huggingface_hub import HfApi, HfFileSystem
-from huggingface_hub.utils import HfHubHTTPError
+from huggingface_hub import HfApi, HfFileSystem, hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError, disable_progress_bars
 
 
 @dataclass
@@ -38,6 +39,11 @@ class DisplayRow:
     dtype: Optional[str] = None
     size: Optional[str] = None
     percent: Optional[str] = None
+    min_value: Optional[str] = None
+    mean_value: Optional[str] = None
+    max_value: Optional[str] = None
+    pcc: Optional[str] = None
+    atol: Optional[str] = None
 
 
 @dataclass
@@ -50,8 +56,27 @@ class IndexGroup:
 class MetadataCacheEntry:
     files: List[str]
     tensors: Dict[str, TensorInfo]
+    tensor_files: Dict[str, str]
     remote_revision_id: str
     revision_checked_at_epoch: int
+
+
+@dataclass
+class TensorCompressionStats:
+    min_val: float
+    mean_val: float
+    max_val: float
+    pcc: float
+    atol: float
+
+
+@dataclass
+class SourceState:
+    source_label: str
+    is_local: bool
+    local_base_dir: Optional[Path]
+    repo_id: Optional[str]
+    revision: Optional[str]
 
 
 def supports_color() -> bool:
@@ -75,8 +100,11 @@ COLOR_SHAPE_DARK = 67
 COLOR_DTYPE = 151
 COLOR_SIZE = 223
 COLOR_PERCENT = 217
+COLOR_PCC = 183
+COLOR_ATOL = 111
+COLOR_ATOL_DARK = 68
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 REVISION_CHECK_TTL_SECONDS = 3600
 
 
@@ -133,6 +161,36 @@ def paint_percent(text: str) -> str:
     return paint(number, COLOR_PERCENT) + paint(" %", COLOR_DARK_GREY)
 
 
+def paint_scientific_e(text: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    return "".join(paint("e", COLOR_DARK_GREY) if char == "e" else char for char in text)
+
+
+def paint_metric_number(text: str, color_code: int) -> str:
+    if not COLOR_ENABLED:
+        return text
+    leading = len(text) - len(text.lstrip(" "))
+    if leading == len(text):
+        return text
+    return text[:leading] + paint(text[leading:], color_code)
+
+
+def paint_scientific_metric(text: str, color_code: int, e_color_code: int = COLOR_DARK_GREY) -> str:
+    if not COLOR_ENABLED:
+        return text
+    leading = len(text) - len(text.lstrip(" "))
+    prefix = text[:leading]
+    body = text[leading:]
+    rendered = ""
+    for char in body:
+        if char == "e":
+            rendered += paint("e", e_color_code)
+        else:
+            rendered += paint(char, color_code)
+    return prefix + rendered
+
+
 def paint_total_size(text: str) -> str:
     if not COLOR_ENABLED:
         return text
@@ -151,7 +209,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "repo",
         nargs="?",
-        help="Hugging Face model repo or URL.",
+        help="Hugging Face model repo/URL or local model path.",
     )
     parser.add_argument(
         "filter_query",
@@ -168,6 +226,12 @@ def parse_args() -> argparse.Namespace:
         "--revision",
         default="main",
         help="Hugging Face revision to inspect (default: main).",
+    )
+    parser.add_argument(
+        "-c",
+        "--compress",
+        choices=["bfp8"],
+        help="Optional host-side compression round-trip to run on matched tensors.",
     )
     return parser.parse_args()
 
@@ -295,9 +359,12 @@ def load_metadata_cache(repo_id: str, revision: str) -> Optional[MetadataCacheEn
 
     files_raw = payload.get("files")
     tensors_raw = payload.get("tensors")
+    tensor_files_raw = payload.get("tensor_files")
     if not isinstance(files_raw, list) or not all(isinstance(value, str) for value in files_raw):
         return None
     if not isinstance(tensors_raw, dict):
+        return None
+    if not isinstance(tensor_files_raw, dict):
         return None
 
     tensors: Dict[str, TensorInfo] = {}
@@ -309,9 +376,16 @@ def load_metadata_cache(repo_id: str, revision: str) -> Optional[MetadataCacheEn
             return None
         tensors[tensor_name] = tensor
 
+    tensor_files: Dict[str, str] = {}
+    for tensor_name, filename in tensor_files_raw.items():
+        if not isinstance(tensor_name, str) or not isinstance(filename, str):
+            return None
+        tensor_files[tensor_name] = filename
+
     return MetadataCacheEntry(
         files=list(files_raw),
         tensors=tensors,
+        tensor_files=tensor_files,
         remote_revision_id=remote_revision_id,
         revision_checked_at_epoch=checked_at_raw,
     )
@@ -324,6 +398,7 @@ def save_metadata_cache(
     revision_checked_at_epoch: int,
     files: List[str],
     tensors: Dict[str, TensorInfo],
+    tensor_files: Dict[str, str],
 ) -> None:
     path = metadata_cache_path(repo_id=repo_id, revision=revision)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -336,15 +411,43 @@ def save_metadata_cache(
         "revision_checked_at_epoch": revision_checked_at_epoch,
         "files": files,
         "tensors": {name: tensor_to_json(tensor) for name, tensor in tensors.items()},
+        "tensor_files": tensor_files,
     }
 
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
     tmp_path.replace(path)
 
 
-def resolve_safetensor_files(api: HfApi, repo_id: str, revision: str) -> Tuple[List[str], Optional[str]]:
+def parse_safetensors_header_bytes(raw: bytes, filename: str) -> Dict[str, object]:
+    if len(raw) < 8:
+        raise RuntimeError(f"{filename}: invalid safetensors header prefix.")
+    header_len = struct.unpack("<Q", raw[:8])[0]
+    header_raw = raw[8 : 8 + header_len]
+    if len(header_raw) != header_len:
+        raise RuntimeError(f"{filename}: truncated safetensors header.")
+    try:
+        return json.loads(header_raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{filename}: invalid JSON in safetensors header.") from exc
+
+
+def normalize_weight_map(raw_weight_map: object, context_name: str) -> Dict[str, str]:
+    if not isinstance(raw_weight_map, dict) or not raw_weight_map:
+        raise RuntimeError(f"{context_name} does not contain a usable weight_map.")
+    weight_map: Dict[str, str] = {}
+    for tensor_name, filename in raw_weight_map.items():
+        if isinstance(tensor_name, str) and isinstance(filename, str):
+            weight_map[tensor_name] = filename
+    if not weight_map:
+        raise RuntimeError(f"{context_name} does not contain a valid tensor->file map.")
+    return weight_map
+
+
+def resolve_safetensor_files(
+    api: HfApi, repo_id: str, revision: str
+) -> Tuple[List[str], Optional[str], Optional[Dict[str, str]]]:
     files = api.list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
 
     index_files = sorted(name for name in files if name.endswith(".safetensors.index.json"))
@@ -353,32 +456,81 @@ def resolve_safetensor_files(api: HfApi, repo_id: str, revision: str) -> Tuple[L
         fs = HfFileSystem()
         with fs.open(f"{repo_id}/{preferred_index}", "rb", revision=revision) as handle:
             index_data = json.load(handle)
-        weight_map = index_data.get("weight_map")
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise RuntimeError(f"Index file {preferred_index} does not contain a usable weight_map.")
-        return sorted(set(weight_map.values())), preferred_index
+        normalized_weight_map = normalize_weight_map(
+            index_data.get("weight_map"),
+            context_name=f"Index file {preferred_index}",
+        )
+        return sorted(set(normalized_weight_map.values())), preferred_index, normalized_weight_map
 
     safetensor_files = sorted(name for name in files if name.endswith(".safetensors"))
     if safetensor_files:
-        return safetensor_files, None
+        return safetensor_files, None, None
 
     raise RuntimeError("No .safetensors files found in this repository.")
 
 
+def resolve_local_safetensor_files(local_path: Path) -> Tuple[Path, List[str], Optional[Dict[str, str]]]:
+    candidate = local_path.expanduser()
+    if not candidate.exists():
+        raise RuntimeError(f"Local path does not exist: {local_path}")
+
+    def relative_posix(path: Path, base_dir: Path) -> str:
+        return path.relative_to(base_dir).as_posix()
+
+    if candidate.is_file():
+        if candidate.name.endswith(".safetensors.index.json"):
+            base_dir = candidate.parent.resolve()
+            with candidate.open("r", encoding="utf-8") as handle:
+                index_data = json.load(handle)
+            weight_map = normalize_weight_map(index_data.get("weight_map"), context_name=f"Index file {candidate.name}")
+            return base_dir, sorted(set(weight_map.values())), weight_map
+        if candidate.name.endswith(".safetensors"):
+            return candidate.parent.resolve(), [candidate.name], None
+        raise RuntimeError("Local file must be a .safetensors or .safetensors.index.json file.")
+
+    base_dir = candidate.resolve()
+    index_candidates = sorted(base_dir.rglob("*.safetensors.index.json"))
+    if index_candidates:
+        preferred_name = "model.safetensors.index.json"
+        preferred = next((path for path in index_candidates if path.name == preferred_name), index_candidates[0])
+        with preferred.open("r", encoding="utf-8") as handle:
+            index_data = json.load(handle)
+        weight_map_raw = normalize_weight_map(index_data.get("weight_map"), context_name=f"Index file {preferred.name}")
+        weight_map = {
+            tensor_name: Path(filename).as_posix()
+            for tensor_name, filename in weight_map_raw.items()
+        }
+        return base_dir, sorted(set(weight_map.values())), weight_map
+
+    safetensor_paths = sorted(base_dir.rglob("*.safetensors"))
+    if safetensor_paths:
+        files = [relative_posix(path, base_dir) for path in safetensor_paths]
+        return base_dir, files, None
+
+    raise RuntimeError("No .safetensors files found in local path.")
+
+
 def read_safetensors_header(fs: HfFileSystem, repo_id: str, filename: str, revision: str) -> Dict[str, object]:
     with fs.open(f"{repo_id}/{filename}", "rb", revision=revision) as handle:
-        length_raw = handle.read(8)
-        if len(length_raw) != 8:
+        prefix = handle.read(8)
+        if len(prefix) != 8:
             raise RuntimeError(f"{filename}: invalid safetensors header prefix.")
-        header_len = struct.unpack("<Q", length_raw)[0]
-        header_raw = handle.read(header_len)
-        if len(header_raw) != header_len:
-            raise RuntimeError(f"{filename}: truncated safetensors header.")
+        header_len = struct.unpack("<Q", prefix)[0]
+        rest = handle.read(header_len)
+    return parse_safetensors_header_bytes(prefix + rest, filename=filename)
 
-    try:
-        return json.loads(header_raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{filename}: invalid JSON in safetensors header.") from exc
+
+def read_safetensors_header_local(base_dir: Path, filename: str) -> Dict[str, object]:
+    path = (base_dir / filename).resolve()
+    if not path.exists():
+        raise RuntimeError(f"{filename}: referenced in index but missing from local path.")
+    with path.open("rb") as handle:
+        prefix = handle.read(8)
+        if len(prefix) != 8:
+            raise RuntimeError(f"{filename}: invalid safetensors header prefix.")
+        header_len = struct.unpack("<Q", prefix)[0]
+        rest = handle.read(header_len)
+    return parse_safetensors_header_bytes(prefix + rest, filename=filename)
 
 
 def dtype_nbytes(dtype: str) -> Optional[int]:
@@ -412,9 +564,10 @@ def estimate_nbytes(shape: Iterable[int], dtype: str) -> int:
     return count * item_size
 
 
-def collect_tensors(repo_id: str, files: List[str], revision: str) -> Dict[str, TensorInfo]:
+def collect_tensors(repo_id: str, files: List[str], revision: str) -> Tuple[Dict[str, TensorInfo], Dict[str, str]]:
     fs = HfFileSystem()
     tensors: Dict[str, TensorInfo] = {}
+    tensor_files: Dict[str, str] = {}
 
     for filename in files:
         header = read_safetensors_header(fs=fs, repo_id=repo_id, filename=filename, revision=revision)
@@ -438,8 +591,40 @@ def collect_tensors(repo_id: str, files: List[str], revision: str) -> Dict[str, 
                 continue
 
             tensors[tensor_name] = TensorInfo(shape=shape, dtype=dtype, nbytes=nbytes)
+            tensor_files[tensor_name] = filename
 
-    return tensors
+    return tensors, tensor_files
+
+
+def collect_tensors_local(base_dir: Path, files: List[str]) -> Tuple[Dict[str, TensorInfo], Dict[str, str]]:
+    tensors: Dict[str, TensorInfo] = {}
+    tensor_files: Dict[str, str] = {}
+
+    for filename in files:
+        header = read_safetensors_header_local(base_dir=base_dir, filename=filename)
+        for tensor_name, tensor_meta in header.items():
+            if tensor_name == "__metadata__":
+                continue
+            if not isinstance(tensor_meta, dict):
+                continue
+
+            shape_raw = tensor_meta.get("shape", [])
+            shape = tuple(int(dim) for dim in shape_raw) if isinstance(shape_raw, list) else tuple()
+            dtype = str(tensor_meta.get("dtype", "UNKNOWN"))
+
+            offsets = tensor_meta.get("data_offsets")
+            if isinstance(offsets, list) and len(offsets) == 2:
+                nbytes = int(offsets[1]) - int(offsets[0])
+            else:
+                nbytes = estimate_nbytes(shape=shape, dtype=dtype)
+
+            if tensor_name in tensors:
+                continue
+
+            tensors[tensor_name] = TensorInfo(shape=shape, dtype=dtype, nbytes=nbytes)
+            tensor_files[tensor_name] = filename
+
+    return tensors, tensor_files
 
 
 def natural_sort_key(value: str) -> List[object]:
@@ -609,41 +794,232 @@ def format_collapsed_indices(indices: List[int]) -> str:
     return f"({joined})"
 
 
-def render_tree(root: TrieNode, total_bytes: int) -> List[str]:
+def collect_tensor_names(root: TrieNode) -> List[str]:
+    names: List[str] = []
+
+    def walk(node: TrieNode, prefix: str) -> None:
+        for name, child in node.children.items():
+            path = f"{prefix}.{name}" if prefix else name
+            if child.tensor is not None:
+                names.append(path)
+            if child.children:
+                walk(child, path)
+
+    walk(root, "")
+    return names
+
+
+def format_scientific(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "inf"
+    mantissa, exponent = f"{value:.1e}".split("e")
+    return f"{mantissa}e{int(exponent)}"
+
+
+def format_compact_value(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "inf"
+    abs_value = abs(value)
+    if abs_value != 0.0 and (abs_value >= 1000.0 or abs_value < 1e-3):
+        return format_scientific(value)
+    return f"{value:.3g}"
+
+
+def format_two_dp(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "inf"
+    rounded = round(value, 2)
+    if rounded == 0:
+        rounded = 0.0
+    return f"{rounded:.2f}"
+
+
+def compute_compression_stats(original_fp32, reconstructed_fp32) -> TensorCompressionStats:
+    import torch
+
+    original = torch.nan_to_num(original_fp32.reshape(-1).to(torch.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    reconstructed = torch.nan_to_num(reconstructed_fp32.reshape(-1).to(torch.float64), nan=0.0, posinf=0.0, neginf=0.0)
+
+    min_val = float(original.min().item()) if original.numel() else 0.0
+    mean_val = float(original.mean().item()) if original.numel() else 0.0
+    max_val = float(original.max().item()) if original.numel() else 0.0
+
+    diff = (reconstructed - original).abs()
+    atol = float(diff.max().item()) if diff.numel() else 0.0
+
+    centered_original = original - original.mean()
+    centered_reconstructed = reconstructed - reconstructed.mean()
+    pcc_denom = torch.linalg.norm(centered_original) * torch.linalg.norm(centered_reconstructed)
+    pcc_denom_value = float(pcc_denom.item())
+    if pcc_denom_value == 0.0:
+        pcc = 1.0 if atol == 0.0 else 0.0
+    else:
+        pcc = float((torch.dot(centered_original, centered_reconstructed) / pcc_denom).item())
+
+    return TensorCompressionStats(min_val=min_val, mean_val=mean_val, max_val=max_val, pcc=pcc, atol=atol)
+
+
+def import_ttnn_quiet():
+    # Quiet noisy import-time logging from ttnn/loguru and TT runtime.
+    os.environ.setdefault("LOGURU_LEVEL", "ERROR")
+    os.environ.setdefault("TTNN_LOG_LEVEL", "ERROR")
+    os.environ.setdefault("TT_METAL_LOGGER_LEVEL", "ERROR")
+    try:
+        import ttnn  # pylint: disable=import-outside-toplevel
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Compression requires `ttnn` in the active Python environment.") from exc
+
+    return ttnn
+
+
+def run_bfp8_compression(
+    source: SourceState,
+    tensor_names: List[str],
+    tensors: Dict[str, TensorInfo],
+    tensor_files: Dict[str, str],
+) -> Dict[str, TensorCompressionStats]:
+    if not tensor_names:
+        return {}
+
+    import torch  # pylint: disable=import-outside-toplevel
+    from safetensors import safe_open  # pylint: disable=import-outside-toplevel
+    from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+    disable_progress_bars()
+    ttnn = import_ttnn_quiet()
+
+    names_by_file: Dict[str, List[str]] = {}
+    total_bytes = 0
+    for tensor_name in tensor_names:
+        info = tensors.get(tensor_name)
+        filename = tensor_files.get(tensor_name)
+        if info is None:
+            raise RuntimeError(f"Missing tensor metadata for {tensor_name}")
+        if filename is None:
+            raise RuntimeError(f"Missing shard mapping for {tensor_name}")
+        names_by_file.setdefault(filename, []).append(tensor_name)
+        total_bytes += info.nbytes
+
+    if not names_by_file:
+        return {}
+
+    stats_by_tensor: Dict[str, TensorCompressionStats] = {}
+    with tqdm(
+        total=total_bytes,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1000,
+        desc="bfp8",
+        dynamic_ncols=True,
+        leave=True,
+    ) as progress:
+        for filename in sorted(names_by_file):
+            if source.is_local:
+                if source.local_base_dir is None:
+                    raise RuntimeError("Internal error: missing local base path for local source.")
+                local_path = str((source.local_base_dir / filename).resolve())
+            else:
+                if source.repo_id is None or source.revision is None:
+                    raise RuntimeError("Internal error: missing repo/revision for remote source.")
+                local_path = hf_hub_download(
+                    repo_id=source.repo_id,
+                    filename=filename,
+                    repo_type="model",
+                    revision=source.revision,
+                )
+            with safe_open(local_path, framework="pt", device="cpu") as handle:
+                for tensor_name in sorted(names_by_file[filename], key=natural_sort_key):
+                    tensor_info = tensors[tensor_name]
+                    original = handle.get_tensor(tensor_name)
+                    original_fp32 = original.to(dtype=torch.float32)
+                    tt_tensor = ttnn.from_torch(
+                        original_fp32,
+                        dtype=ttnn.bfloat8_b,
+                        layout=ttnn.TILE_LAYOUT,
+                    )
+                    roundtrip_fp32 = ttnn.to_torch(tt_tensor).to(dtype=torch.float32)
+
+                    stats_by_tensor[tensor_name] = compute_compression_stats(original_fp32, roundtrip_fp32)
+                    progress.update(tensor_info.nbytes)
+
+                    del tt_tensor
+                    del roundtrip_fp32
+                    del original_fp32
+                    del original
+
+    return stats_by_tensor
+
+
+def render_tree(
+    root: TrieNode,
+    total_bytes: int,
+    compression_stats: Optional[Dict[str, TensorCompressionStats]] = None,
+) -> List[str]:
     rows: List[DisplayRow] = []
     signature_cache: Dict[int, object] = {}
+    include_compression = compression_stats is not None
 
-    def add_tensor_row(label: str, tensor: TensorInfo, multiplier: int) -> None:
+    def join_path(prefix: str, child: str) -> str:
+        return f"{prefix}.{child}" if prefix else child
+
+    def add_tensor_row(label: str, tensor: TensorInfo, multiplier: int, tensor_paths: List[str]) -> None:
         effective_nbytes = tensor.nbytes * multiplier
         percent = (100.0 * effective_nbytes / total_bytes) if total_bytes else 0.0
-        rows.append(
-            DisplayRow(
-                label=label,
-                shape=format_shape(tensor.shape),
-                dtype=tensor.dtype,
-                size=format_bytes(tensor.nbytes),
-                percent=format_percent(percent),
-            )
+        row = DisplayRow(
+            label=label,
+            shape=format_shape(tensor.shape),
+            dtype=tensor.dtype,
+            size=format_bytes(tensor.nbytes),
+            percent=format_percent(percent),
         )
+        if include_compression:
+            matched_stats = [compression_stats[path] for path in tensor_paths if path in compression_stats]
+            if matched_stats:
+                min_value = min(stat.min_val for stat in matched_stats)
+                mean_value = sum(stat.mean_val for stat in matched_stats) / len(matched_stats)
+                max_value = max(stat.max_val for stat in matched_stats)
+                worst_pcc = min(stat.pcc for stat in matched_stats)
+                worst_atol = max(stat.atol for stat in matched_stats)
 
-    def walk(node: TrieNode, indent: str, multiplier: int) -> None:
+                row.min_value = format_two_dp(min_value)
+                row.mean_value = format_two_dp(mean_value)
+                row.max_value = format_two_dp(max_value)
+                row.pcc = f"{worst_pcc:.4f}"
+                row.atol = format_scientific(worst_atol)
+        rows.append(row)
+
+    def walk(node: TrieNode, indent: str, multiplier: int, path_prefixes: List[str]) -> None:
         groups = index_groups(node, signature_cache)
         if groups is not None and len(groups) == 1:
             group = groups[0]
             label = format_collapsed_indices(group.indices)
             rows.append(DisplayRow(label=f"{indent}{label}"))
-            walk(group.representative, indent + "  ", multiplier * len(group.indices))
+            group_prefixes = [join_path(prefix, str(index)) for prefix in path_prefixes for index in group.indices]
+            walk(group.representative, indent + "  ", multiplier * len(group.indices), group_prefixes)
             return
         if groups is not None:
             for group in groups:
                 label = format_collapsed_indices(group.indices)
                 rows.append(DisplayRow(label=f"{indent}{label}"))
-                walk(group.representative, indent + "  ", multiplier * len(group.indices))
+                group_prefixes = [join_path(prefix, str(index)) for prefix in path_prefixes for index in group.indices]
+                walk(group.representative, indent + "  ", multiplier * len(group.indices), group_prefixes)
             return
 
         for name, child in sorted(node.children.items(), key=lambda item: natural_sort_key(item[0])):
+            child_prefixes = [join_path(prefix, name) for prefix in path_prefixes]
             if child.tensor is not None and not child.children:
-                add_tensor_row(label=f"{indent}{name}", tensor=child.tensor, multiplier=multiplier)
+                add_tensor_row(
+                    label=f"{indent}{name}",
+                    tensor=child.tensor,
+                    multiplier=multiplier,
+                    tensor_paths=child_prefixes,
+                )
                 continue
 
             # Special case: F8 packed weights commonly store an adjacent scale tensor.
@@ -661,7 +1037,12 @@ def render_tree(root: TrieNode, total_bytes: int) -> List[str]:
                 and not scale_inv_child.children
                 and f8_weight_child.tensor.dtype.startswith("F8_")
             ):
-                add_tensor_row(label=f"{indent}{name}", tensor=f8_weight_child.tensor, multiplier=multiplier)
+                add_tensor_row(
+                    label=f"{indent}{name}",
+                    tensor=f8_weight_child.tensor,
+                    multiplier=multiplier,
+                    tensor_paths=[join_path(prefix, "weight") for prefix in child_prefixes],
+                )
                 continue
 
             weight_child = child.children.get("weight")
@@ -672,7 +1053,12 @@ def render_tree(root: TrieNode, total_bytes: int) -> List[str]:
                 and weight_child.tensor is not None
                 and not weight_child.children
             ):
-                add_tensor_row(label=f"{indent}{name}", tensor=weight_child.tensor, multiplier=multiplier)
+                add_tensor_row(
+                    label=f"{indent}{name}",
+                    tensor=weight_child.tensor,
+                    multiplier=multiplier,
+                    tensor_paths=[join_path(prefix, "weight") for prefix in child_prefixes],
+                )
                 continue
 
             child_groups = index_groups(child, signature_cache)
@@ -680,25 +1066,32 @@ def render_tree(root: TrieNode, total_bytes: int) -> List[str]:
                 group = child_groups[0]
                 collapse_label = format_collapsed_indices(group.indices)
                 rows.append(DisplayRow(label=f"{indent}{name} {collapse_label}"))
-                walk(group.representative, indent + "  ", multiplier * len(group.indices))
+                group_prefixes = [join_path(prefix, str(index)) for prefix in child_prefixes for index in group.indices]
+                walk(group.representative, indent + "  ", multiplier * len(group.indices), group_prefixes)
                 continue
             if child_groups is not None:
                 rows.append(DisplayRow(label=f"{indent}{name}"))
                 for group in child_groups:
                     group_label = format_collapsed_indices(group.indices)
                     rows.append(DisplayRow(label=f"{indent}  {group_label}"))
-                    walk(group.representative, indent + "    ", multiplier * len(group.indices))
+                    group_prefixes = [join_path(prefix, str(index)) for prefix in child_prefixes for index in group.indices]
+                    walk(group.representative, indent + "    ", multiplier * len(group.indices), group_prefixes)
                 continue
 
             rows.append(DisplayRow(label=f"{indent}{name}"))
-            walk(child, indent + "  ", multiplier)
+            walk(child, indent + "  ", multiplier, child_prefixes)
 
-    walk(root, "", 1)
+    walk(root, "", 1, [""])
     label_width = max((len(row.label) for row in rows), default=0)
     shape_width = max((len(row.shape) for row in rows if row.shape is not None), default=0)
     dtype_width = max((len(row.dtype) for row in rows if row.dtype is not None), default=0)
     size_width = max((len(row.size) for row in rows if row.size is not None), default=0)
     percent_width = max((len(row.percent) for row in rows if row.percent is not None), default=0)
+    min_width = max((len((row.min_value or "-")) for row in rows if row.shape is not None), default=0)
+    mean_width = max((len((row.mean_value or "-")) for row in rows if row.shape is not None), default=0)
+    max_width = max((len((row.max_value or "-")) for row in rows if row.shape is not None), default=0)
+    pcc_width = max((len((row.pcc or "-")) for row in rows if row.shape is not None), default=0)
+    atol_width = max((len((row.atol or "-")) for row in rows if row.shape is not None), default=0)
 
     lines: List[str] = []
     for row in rows:
@@ -717,51 +1110,100 @@ def render_tree(root: TrieNode, total_bytes: int) -> List[str]:
                 f"{size_cell}  "
                 f"{percent_cell}"
             )
+            if include_compression:
+                min_cell = paint_scientific_e((row.min_value or "-").rjust(min_width))
+                mean_cell = paint_scientific_e((row.mean_value or "-").rjust(mean_width))
+                max_cell = paint_scientific_e((row.max_value or "-").rjust(max_width))
+                pcc_cell = paint_metric_number((row.pcc or "-").rjust(pcc_width), COLOR_PCC)
+                atol_cell = paint_scientific_metric(
+                    (row.atol or "-").rjust(atol_width), COLOR_ATOL, COLOR_ATOL_DARK
+                )
+                lines[-1] += (
+                    f"{paint_dark('  |  ')}"
+                    f"{min_cell}{paint_dark(' ≤ ')}{mean_cell}{paint_dark(' ≤ ')}{max_cell}"
+                    f"{paint_dark('  |  ')}"
+                    f"{paint_dark('bfp8  ')}"
+                    f"{pcc_cell}{paint_dark(' pcc')}  "
+                    f"{atol_cell}{paint_dark(' atol')}"
+                )
     return lines
 
 
-def do_list(raw_repo: str, revision: str, filter_query: Optional[str]) -> int:
-    repo_id = normalize_repo_id(raw_repo)
-    api = HfApi()
-    now_epoch = int(time.time())
-    cached = load_metadata_cache(repo_id=repo_id, revision=revision)
-
-    # Skip remote revision checks for recently-validated cache entries.
-    if cached is not None and (now_epoch - cached.revision_checked_at_epoch) < REVISION_CHECK_TTL_SECONDS:
-        files, tensors = cached.files, cached.tensors
+def do_list(raw_repo: str, revision: str, filter_query: Optional[str], compress: Optional[str]) -> int:
+    local_candidate = Path(raw_repo).expanduser()
+    if local_candidate.exists():
+        local_base_dir, files, _weight_map = resolve_local_safetensor_files(local_candidate)
+        tensors, tensor_files = collect_tensors_local(base_dir=local_base_dir, files=files)
+        source = SourceState(
+            source_label=str(local_candidate.expanduser().absolute()),
+            is_local=True,
+            local_base_dir=local_base_dir,
+            repo_id=None,
+            revision=None,
+        )
     else:
-        remote_revision_id = get_remote_revision_id(api=api, repo_id=repo_id, revision=revision)
+        repo_id = normalize_repo_id(raw_repo)
+        api = HfApi()
+        now_epoch = int(time.time())
+        cached = load_metadata_cache(repo_id=repo_id, revision=revision)
 
-        if cached is not None and cached.remote_revision_id == remote_revision_id:
-            files, tensors = cached.files, cached.tensors
-            save_metadata_cache(
-                repo_id=repo_id,
-                revision=revision,
-                remote_revision_id=remote_revision_id,
-                revision_checked_at_epoch=now_epoch,
-                files=files,
-                tensors=tensors,
-            )
+        # Skip remote revision checks for recently-validated cache entries.
+        if cached is not None and (now_epoch - cached.revision_checked_at_epoch) < REVISION_CHECK_TTL_SECONDS:
+            files, tensors, tensor_files = cached.files, cached.tensors, cached.tensor_files
         else:
-            files, _index_file = resolve_safetensor_files(api=api, repo_id=repo_id, revision=revision)
-            tensors = collect_tensors(repo_id=repo_id, files=files, revision=revision)
-            save_metadata_cache(
-                repo_id=repo_id,
-                revision=revision,
-                remote_revision_id=remote_revision_id,
-                revision_checked_at_epoch=now_epoch,
-                files=files,
-                tensors=tensors,
-            )
+            remote_revision_id = get_remote_revision_id(api=api, repo_id=repo_id, revision=revision)
+
+            if cached is not None and cached.remote_revision_id == remote_revision_id:
+                files, tensors, tensor_files = cached.files, cached.tensors, cached.tensor_files
+                save_metadata_cache(
+                    repo_id=repo_id,
+                    revision=revision,
+                    remote_revision_id=remote_revision_id,
+                    revision_checked_at_epoch=now_epoch,
+                    files=files,
+                    tensors=tensors,
+                    tensor_files=tensor_files,
+                )
+            else:
+                files, _index_file, _weight_map = resolve_safetensor_files(api=api, repo_id=repo_id, revision=revision)
+                tensors, tensor_files = collect_tensors(repo_id=repo_id, files=files, revision=revision)
+                save_metadata_cache(
+                    repo_id=repo_id,
+                    revision=revision,
+                    remote_revision_id=remote_revision_id,
+                    revision_checked_at_epoch=now_epoch,
+                    files=files,
+                    tensors=tensors,
+                    tensor_files=tensor_files,
+                )
+
+        source = SourceState(
+            source_label=repo_id,
+            is_local=False,
+            local_base_dir=None,
+            repo_id=repo_id,
+            revision=revision,
+        )
 
     trie = build_trie(tensors)
     trie = filter_trie(trie, filter_query)
 
+    compression_stats: Optional[Dict[str, TensorCompressionStats]] = None
+    if compress == "bfp8":
+        tensor_names = collect_tensor_names(trie)
+        compression_stats = run_bfp8_compression(
+            source=source,
+            tensor_names=tensor_names,
+            tensors=tensors,
+            tensor_files=tensor_files,
+        )
+
     total_bytes = sum(tensor.nbytes for tensor in tensors.values())
     file_word = "file" if len(files) == 1 else "files"
     tensor_word = "tensor" if len(tensors) == 1 else "tensors"
+    revision_label = paint_dark("(local)") if source.is_local else paint_dark(f"({revision})")
     print(
-        f"{paint(repo_id, COLOR_WHITE)} {paint_dark(f'({revision})')}"
+        f"{paint(source.source_label, COLOR_WHITE)} {revision_label}"
         f"{paint_dark(' - ')}"
         f"{len(files)} {paint_dark(file_word)}"
         f"{paint_dark(', ')}"
@@ -770,7 +1212,7 @@ def do_list(raw_repo: str, revision: str, filter_query: Optional[str]) -> int:
         f"{paint_total_size(format_bytes(total_bytes))}"
     )
 
-    for line in render_tree(trie, total_bytes=total_bytes):
+    for line in render_tree(trie, total_bytes=total_bytes, compression_stats=compression_stats):
         print(line)
     return 0
 
@@ -779,7 +1221,7 @@ def main() -> int:
     args = parse_args()
     repo_arg = args.list_repo if args.list_repo else args.repo
     if not repo_arg:
-        print("usage: we <HF_URL_OR_REPO> [FILTER_QUERY] [--revision REVISION]", file=sys.stderr)
+        print("usage: we <HF_URL_OR_REPO> [FILTER_QUERY] [--revision REVISION] [-c bfp8]", file=sys.stderr)
         return 2
 
     filter_query = " ".join(args.filter_query).strip()
@@ -787,7 +1229,7 @@ def main() -> int:
         filter_query = None
 
     try:
-        return do_list(raw_repo=repo_arg, revision=args.revision, filter_query=filter_query)
+        return do_list(raw_repo=repo_arg, revision=args.revision, filter_query=filter_query, compress=args.compress)
     except (ValueError, RuntimeError, HfHubHTTPError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
