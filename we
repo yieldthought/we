@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import struct
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
+
+from huggingface_hub import HfApi, HfFileSystem
+from huggingface_hub.utils import HfHubHTTPError
+
+
+@dataclass
+class TensorInfo:
+    shape: Tuple[int, ...]
+    dtype: str
+    nbytes: int
+
+
+@dataclass
+class TrieNode:
+    children: Dict[str, "TrieNode"] = field(default_factory=dict)
+    tensor: Optional[TensorInfo] = None
+
+
+@dataclass
+class DisplayRow:
+    label: str
+    shape: Optional[str] = None
+    dtype: Optional[str] = None
+    size: Optional[str] = None
+    percent: Optional[str] = None
+
+
+@dataclass
+class IndexGroup:
+    indices: List[int]
+    representative: TrieNode
+
+
+@dataclass
+class MetadataCacheEntry:
+    files: List[str]
+    tensors: Dict[str, TensorInfo]
+    remote_revision_id: str
+    revision_checked_at_epoch: int
+
+
+def supports_color() -> bool:
+    if os.getenv("NO_COLOR") is not None:
+        return False
+    if os.getenv("FORCE_COLOR") is not None:
+        return True
+    term = os.getenv("TERM", "").lower()
+    if term in {"", "dumb"}:
+        return False
+    return sys.stdout.isatty()
+
+
+COLOR_ENABLED = supports_color()
+
+COLOR_DARK_GREY = 242
+COLOR_WHITE = 15
+COLOR_LIGHT_GREY = 250
+COLOR_SHAPE = 153
+COLOR_SHAPE_DARK = 67
+COLOR_DTYPE = 151
+COLOR_SIZE = 223
+COLOR_PERCENT = 217
+
+CACHE_SCHEMA_VERSION = 1
+REVISION_CHECK_TTL_SECONDS = 3600
+
+
+def paint(text: str, color_code: int) -> str:
+    if not COLOR_ENABLED:
+        return text
+    return f"\x1b[38;5;{color_code}m{text}\x1b[0m"
+
+
+def paint_dark(text: str) -> str:
+    return paint(text, COLOR_DARK_GREY)
+
+
+def paint_label(text: str, has_tensor: bool) -> str:
+    base_color = COLOR_LIGHT_GREY if has_tensor else COLOR_WHITE
+    if not COLOR_ENABLED:
+        return text
+    return paint(text, base_color)
+
+
+def paint_shape(text: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    if "x" not in text:
+        return paint(text, COLOR_SHAPE)
+    parts = text.split("x")
+    rendered = paint(parts[0], COLOR_SHAPE)
+    for part in parts[1:]:
+        rendered += paint("x", COLOR_SHAPE_DARK) + paint(part, COLOR_SHAPE)
+    return rendered
+
+
+def paint_dtype(text: str) -> str:
+    return paint(text, COLOR_DTYPE)
+
+
+def paint_size(text: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    try:
+        number, unit = text.rsplit(" ", 1)
+    except ValueError:
+        return paint(text, COLOR_SIZE)
+    return paint(number, COLOR_SIZE) + paint(f" {unit}", COLOR_DARK_GREY)
+
+
+def paint_percent(text: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    stripped = text.strip()
+    if not stripped.endswith("%"):
+        return paint(text, COLOR_PERCENT)
+    number = stripped[:-1].strip()
+    return paint(number, COLOR_PERCENT) + paint(" %", COLOR_DARK_GREY)
+
+
+def paint_total_size(text: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    try:
+        number, unit = text.rsplit(" ", 1)
+    except ValueError:
+        return paint(text, COLOR_PERCENT)
+    return paint(number, COLOR_PERCENT) + paint(f" {unit}", COLOR_DARK_GREY)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="we",
+        description="Weight evaluation helper for Hugging Face checkpoints.",
+    )
+    parser.add_argument(
+        "repo",
+        nargs="?",
+        help="Hugging Face model repo or URL.",
+    )
+    parser.add_argument(
+        "filter_query",
+        nargs="*",
+        help="Optional filter: substring match, or exact torch-style path if dotted (e.g. model.layers.1).",
+    )
+    parser.add_argument(
+        "--list",
+        dest="list_repo",
+        metavar="HF_URL_OR_REPO",
+        help="List tensors from a Hugging Face model repo (legacy; default behavior no longer needs this flag).",
+    )
+    parser.add_argument(
+        "--revision",
+        default="main",
+        help="Hugging Face revision to inspect (default: main).",
+    )
+    return parser.parse_args()
+
+
+def normalize_repo_id(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        raise ValueError("Empty repo value.")
+
+    if "://" not in value:
+        return value.strip("/")
+
+    parsed = urlparse(value)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in {"huggingface.co", "hf.co"}:
+        raise ValueError(f"Unsupported host: {parsed.netloc}")
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        raise ValueError("URL path does not contain a repo id.")
+
+    if parts[0] in {"models", "model"}:
+        parts = parts[1:]
+    elif parts[0] in {"datasets", "spaces"}:
+        raise ValueError("Only model repos are supported.")
+
+    stop_tokens = {"tree", "blob", "resolve", "commit", "discussions"}
+    for idx, part in enumerate(parts):
+        if part in stop_tokens:
+            parts = parts[:idx]
+            break
+
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return parts[0]
+
+
+def metadata_cache_dir() -> Path:
+    env_dir = os.getenv("WE_CACHE_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser() / "metadata"
+    xdg_cache_home = os.getenv("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return Path(xdg_cache_home).expanduser() / "we" / "metadata"
+    return Path.home() / ".cache" / "we" / "metadata"
+
+
+def metadata_cache_path(repo_id: str, revision: str) -> Path:
+    safe_repo = repo_id.replace("/", "__")
+    safe_revision = re.sub(r"[^A-Za-z0-9._-]+", "_", revision)
+    digest = hashlib.sha1(f"{repo_id}@{revision}".encode("utf-8")).hexdigest()[:12]
+    filename = f"{safe_repo}--{safe_revision}--{digest}.json"
+    return metadata_cache_dir() / filename
+
+
+def tensor_to_json(tensor: TensorInfo) -> Dict[str, object]:
+    return {
+        "shape": list(tensor.shape),
+        "dtype": tensor.dtype,
+        "nbytes": tensor.nbytes,
+    }
+
+
+def tensor_from_json(data: object) -> Optional[TensorInfo]:
+    if not isinstance(data, dict):
+        return None
+    shape_raw = data.get("shape")
+    dtype_raw = data.get("dtype")
+    nbytes_raw = data.get("nbytes")
+    if not isinstance(shape_raw, list):
+        return None
+    if not isinstance(dtype_raw, str):
+        return None
+    if not isinstance(nbytes_raw, int):
+        return None
+    try:
+        shape = tuple(int(dim) for dim in shape_raw)
+    except (TypeError, ValueError):
+        return None
+    return TensorInfo(shape=shape, dtype=dtype_raw, nbytes=nbytes_raw)
+
+
+def get_remote_revision_id(api: HfApi, repo_id: str, revision: str) -> str:
+    info = api.model_info(repo_id=repo_id, revision=revision)
+    sha = getattr(info, "sha", None)
+    if sha:
+        return f"sha:{sha}"
+
+    last_modified = getattr(info, "last_modified", None)
+    if last_modified is not None:
+        if hasattr(last_modified, "isoformat"):
+            return f"last_modified:{last_modified.isoformat()}"
+        return f"last_modified:{last_modified}"
+
+    return f"revision:{revision}"
+
+
+def load_metadata_cache(repo_id: str, revision: str) -> Optional[MetadataCacheEntry]:
+    path = metadata_cache_path(repo_id=repo_id, revision=revision)
+    if not path.exists():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return None
+    if payload.get("repo_id") != repo_id:
+        return None
+    if payload.get("revision") != revision:
+        return None
+    remote_revision_id = payload.get("remote_revision_id")
+    if not isinstance(remote_revision_id, str) or not remote_revision_id:
+        return None
+    checked_at_raw = payload.get("revision_checked_at_epoch")
+    if not isinstance(checked_at_raw, int):
+        return None
+
+    files_raw = payload.get("files")
+    tensors_raw = payload.get("tensors")
+    if not isinstance(files_raw, list) or not all(isinstance(value, str) for value in files_raw):
+        return None
+    if not isinstance(tensors_raw, dict):
+        return None
+
+    tensors: Dict[str, TensorInfo] = {}
+    for tensor_name, tensor_data in tensors_raw.items():
+        if not isinstance(tensor_name, str):
+            return None
+        tensor = tensor_from_json(tensor_data)
+        if tensor is None:
+            return None
+        tensors[tensor_name] = tensor
+
+    return MetadataCacheEntry(
+        files=list(files_raw),
+        tensors=tensors,
+        remote_revision_id=remote_revision_id,
+        revision_checked_at_epoch=checked_at_raw,
+    )
+
+
+def save_metadata_cache(
+    repo_id: str,
+    revision: str,
+    remote_revision_id: str,
+    revision_checked_at_epoch: int,
+    files: List[str],
+    tensors: Dict[str, TensorInfo],
+) -> None:
+    path = metadata_cache_path(repo_id=repo_id, revision=revision)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "repo_id": repo_id,
+        "revision": revision,
+        "remote_revision_id": remote_revision_id,
+        "revision_checked_at_epoch": revision_checked_at_epoch,
+        "files": files,
+        "tensors": {name: tensor_to_json(tensor) for name, tensor in tensors.items()},
+    }
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+    tmp_path.replace(path)
+
+
+def resolve_safetensor_files(api: HfApi, repo_id: str, revision: str) -> Tuple[List[str], Optional[str]]:
+    files = api.list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
+
+    index_files = sorted(name for name in files if name.endswith(".safetensors.index.json"))
+    if index_files:
+        preferred_index = "model.safetensors.index.json" if "model.safetensors.index.json" in index_files else index_files[0]
+        fs = HfFileSystem()
+        with fs.open(f"{repo_id}/{preferred_index}", "rb", revision=revision) as handle:
+            index_data = json.load(handle)
+        weight_map = index_data.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError(f"Index file {preferred_index} does not contain a usable weight_map.")
+        return sorted(set(weight_map.values())), preferred_index
+
+    safetensor_files = sorted(name for name in files if name.endswith(".safetensors"))
+    if safetensor_files:
+        return safetensor_files, None
+
+    raise RuntimeError("No .safetensors files found in this repository.")
+
+
+def read_safetensors_header(fs: HfFileSystem, repo_id: str, filename: str, revision: str) -> Dict[str, object]:
+    with fs.open(f"{repo_id}/{filename}", "rb", revision=revision) as handle:
+        length_raw = handle.read(8)
+        if len(length_raw) != 8:
+            raise RuntimeError(f"{filename}: invalid safetensors header prefix.")
+        header_len = struct.unpack("<Q", length_raw)[0]
+        header_raw = handle.read(header_len)
+        if len(header_raw) != header_len:
+            raise RuntimeError(f"{filename}: truncated safetensors header.")
+
+    try:
+        return json.loads(header_raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{filename}: invalid JSON in safetensors header.") from exc
+
+
+def dtype_nbytes(dtype: str) -> Optional[int]:
+    sizes = {
+        "BOOL": 1,
+        "U8": 1,
+        "I8": 1,
+        "F8_E4M3FN": 1,
+        "F8_E5M2": 1,
+        "I16": 2,
+        "U16": 2,
+        "F16": 2,
+        "BF16": 2,
+        "I32": 4,
+        "U32": 4,
+        "F32": 4,
+        "I64": 8,
+        "U64": 8,
+        "F64": 8,
+    }
+    return sizes.get(dtype)
+
+
+def estimate_nbytes(shape: Iterable[int], dtype: str) -> int:
+    item_size = dtype_nbytes(dtype)
+    if item_size is None:
+        return 0
+    count = 1
+    for dim in shape:
+        count *= int(dim)
+    return count * item_size
+
+
+def collect_tensors(repo_id: str, files: List[str], revision: str) -> Dict[str, TensorInfo]:
+    fs = HfFileSystem()
+    tensors: Dict[str, TensorInfo] = {}
+
+    for filename in files:
+        header = read_safetensors_header(fs=fs, repo_id=repo_id, filename=filename, revision=revision)
+        for tensor_name, tensor_meta in header.items():
+            if tensor_name == "__metadata__":
+                continue
+            if not isinstance(tensor_meta, dict):
+                continue
+
+            shape_raw = tensor_meta.get("shape", [])
+            shape = tuple(int(dim) for dim in shape_raw) if isinstance(shape_raw, list) else tuple()
+            dtype = str(tensor_meta.get("dtype", "UNKNOWN"))
+
+            offsets = tensor_meta.get("data_offsets")
+            if isinstance(offsets, list) and len(offsets) == 2:
+                nbytes = int(offsets[1]) - int(offsets[0])
+            else:
+                nbytes = estimate_nbytes(shape=shape, dtype=dtype)
+
+            if tensor_name in tensors:
+                continue
+
+            tensors[tensor_name] = TensorInfo(shape=shape, dtype=dtype, nbytes=nbytes)
+
+    return tensors
+
+
+def natural_sort_key(value: str) -> List[object]:
+    parts = re.split(r"(\d+)", value)
+    key: List[object] = []
+    for part in parts:
+        if part.isdigit():
+            key.append(int(part))
+        else:
+            key.append(part)
+    return key
+
+
+def build_trie(tensors: Dict[str, TensorInfo]) -> TrieNode:
+    root = TrieNode()
+    for tensor_name, tensor in sorted(tensors.items(), key=lambda item: natural_sort_key(item[0])):
+        parts = tensor_name.split(".")
+        node = root
+        for part in parts[:-1]:
+            node = node.children.setdefault(part, TrieNode())
+        leaf = node.children.setdefault(parts[-1], TrieNode())
+        leaf.tensor = tensor
+    return root
+
+
+def clone_trie(node: TrieNode) -> TrieNode:
+    cloned = TrieNode(tensor=node.tensor)
+    for name, child in node.children.items():
+        cloned.children[name] = clone_trie(child)
+    return cloned
+
+
+def filter_trie(root: TrieNode, query: Optional[str]) -> TrieNode:
+    if not query:
+        return root
+
+    trimmed = query.strip()
+    if not trimmed:
+        return root
+
+    # Dotted queries are treated as torch-style paths (exact segment matching),
+    # e.g. model.layers.1 -> only that module/tensor subtree.
+    if "." in trimmed:
+        query_parts = [part.lower() for part in trimmed.split(".") if part]
+
+        def walk_path(node: TrieNode, lower_path_parts: List[str]) -> Optional[TrieNode]:
+            if lower_path_parts != query_parts[: len(lower_path_parts)]:
+                return None
+            if len(lower_path_parts) == len(query_parts):
+                return clone_trie(node)
+
+            filtered = TrieNode()
+            for name, child in node.children.items():
+                kept_child = walk_path(child, lower_path_parts + [name.lower()])
+                if kept_child is not None:
+                    filtered.children[name] = kept_child
+
+            if not filtered.children:
+                return None
+            return filtered
+
+        kept_root = walk_path(root, [])
+    else:
+        needle = trimmed.lower()
+
+        def walk_substring(node: TrieNode, path_parts: List[str]) -> Optional[TrieNode]:
+            path = ".".join(path_parts).lower()
+            if path_parts and needle in path:
+                return clone_trie(node)
+
+            filtered = TrieNode()
+            for name, child in node.children.items():
+                kept_child = walk_substring(child, path_parts + [name])
+                if kept_child is not None:
+                    filtered.children[name] = kept_child
+
+            if not filtered.children:
+                return None
+            return filtered
+
+        kept_root = walk_substring(root, [])
+
+    if kept_root is None:
+        return TrieNode()
+    return kept_root
+
+
+def compute_signature(node: TrieNode, cache: Dict[int, object]) -> object:
+    node_id = id(node)
+    if node_id in cache:
+        return cache[node_id]
+
+    tensor_sig = None
+    if node.tensor is not None:
+        tensor_sig = (node.tensor.shape, node.tensor.dtype, node.tensor.nbytes)
+
+    child_sig = tuple(
+        (name, compute_signature(child, cache))
+        for name, child in sorted(node.children.items(), key=lambda item: natural_sort_key(item[0]))
+    )
+    signature = (tensor_sig, child_sig)
+    cache[node_id] = signature
+    return signature
+
+
+def index_groups(node: TrieNode, signature_cache: Dict[int, object]) -> Optional[List[IndexGroup]]:
+    if len(node.children) < 2:
+        return None
+    if not all(name.isdigit() for name in node.children):
+        return None
+
+    ordered = sorted((int(name), child) for name, child in node.children.items())
+    groups: List[IndexGroup] = []
+
+    current_indices: List[int] = [ordered[0][0]]
+    current_rep = ordered[0][1]
+    current_sig = compute_signature(current_rep, signature_cache)
+
+    for idx, child in ordered[1:]:
+        sig = compute_signature(child, signature_cache)
+        if sig == current_sig:
+            current_indices.append(idx)
+            continue
+
+        groups.append(IndexGroup(indices=current_indices, representative=current_rep))
+        current_indices = [idx]
+        current_rep = child
+        current_sig = sig
+
+    groups.append(IndexGroup(indices=current_indices, representative=current_rep))
+
+    if all(len(group.indices) == 1 for group in groups):
+        return None
+    return groups
+
+
+def format_shape(shape: Tuple[int, ...]) -> str:
+    if not shape:
+        return "scalar"
+    return "x".join(str(dim) for dim in shape)
+
+
+def format_bytes(num_bytes: int) -> str:
+    if num_bytes < 1000:
+        return f"{num_bytes} B"
+    value = float(num_bytes)
+    for unit in ("KB", "MB", "GB", "TB", "PB"):
+        value /= 1000.0
+        if value < 1000.0 or unit == "PB":
+            return f"{value:.1f} {unit}"
+    return f"{num_bytes} B"
+
+
+def format_percent(value: float) -> str:
+    return f"{value:.1f} %"
+
+
+def format_collapsed_indices(indices: List[int]) -> str:
+    if len(indices) == 1:
+        return str(indices[0])
+    first = indices[0]
+    last = indices[-1]
+    is_contiguous = (last - first + 1) == len(indices)
+    if is_contiguous:
+        return f"({first}-{last})"
+    joined = ",".join(str(value) for value in indices)
+    return f"({joined})"
+
+
+def render_tree(root: TrieNode, total_bytes: int) -> List[str]:
+    rows: List[DisplayRow] = []
+    signature_cache: Dict[int, object] = {}
+
+    def add_tensor_row(label: str, tensor: TensorInfo, multiplier: int) -> None:
+        effective_nbytes = tensor.nbytes * multiplier
+        percent = (100.0 * effective_nbytes / total_bytes) if total_bytes else 0.0
+        rows.append(
+            DisplayRow(
+                label=label,
+                shape=format_shape(tensor.shape),
+                dtype=tensor.dtype,
+                size=format_bytes(tensor.nbytes),
+                percent=format_percent(percent),
+            )
+        )
+
+    def walk(node: TrieNode, indent: str, multiplier: int) -> None:
+        groups = index_groups(node, signature_cache)
+        if groups is not None and len(groups) == 1:
+            group = groups[0]
+            label = format_collapsed_indices(group.indices)
+            rows.append(DisplayRow(label=f"{indent}{label}"))
+            walk(group.representative, indent + "  ", multiplier * len(group.indices))
+            return
+        if groups is not None:
+            for group in groups:
+                label = format_collapsed_indices(group.indices)
+                rows.append(DisplayRow(label=f"{indent}{label}"))
+                walk(group.representative, indent + "  ", multiplier * len(group.indices))
+            return
+
+        for name, child in sorted(node.children.items(), key=lambda item: natural_sort_key(item[0])):
+            if child.tensor is not None and not child.children:
+                add_tensor_row(label=f"{indent}{name}", tensor=child.tensor, multiplier=multiplier)
+                continue
+
+            # Special case: F8 packed weights commonly store an adjacent scale tensor.
+            # Render these as a single logical weight row and hide weight_scale_inv.
+            f8_weight_child = child.children.get("weight")
+            scale_inv_child = child.children.get("weight_scale_inv")
+            if (
+                child.tensor is None
+                and len(child.children) == 2
+                and f8_weight_child is not None
+                and scale_inv_child is not None
+                and f8_weight_child.tensor is not None
+                and not f8_weight_child.children
+                and scale_inv_child.tensor is not None
+                and not scale_inv_child.children
+                and f8_weight_child.tensor.dtype.startswith("F8_")
+            ):
+                add_tensor_row(label=f"{indent}{name}", tensor=f8_weight_child.tensor, multiplier=multiplier)
+                continue
+
+            weight_child = child.children.get("weight")
+            if (
+                child.tensor is None
+                and len(child.children) == 1
+                and weight_child is not None
+                and weight_child.tensor is not None
+                and not weight_child.children
+            ):
+                add_tensor_row(label=f"{indent}{name}", tensor=weight_child.tensor, multiplier=multiplier)
+                continue
+
+            child_groups = index_groups(child, signature_cache)
+            if child_groups is not None and len(child_groups) == 1:
+                group = child_groups[0]
+                collapse_label = format_collapsed_indices(group.indices)
+                rows.append(DisplayRow(label=f"{indent}{name} {collapse_label}"))
+                walk(group.representative, indent + "  ", multiplier * len(group.indices))
+                continue
+            if child_groups is not None:
+                rows.append(DisplayRow(label=f"{indent}{name}"))
+                for group in child_groups:
+                    group_label = format_collapsed_indices(group.indices)
+                    rows.append(DisplayRow(label=f"{indent}  {group_label}"))
+                    walk(group.representative, indent + "    ", multiplier * len(group.indices))
+                continue
+
+            rows.append(DisplayRow(label=f"{indent}{name}"))
+            walk(child, indent + "  ", multiplier)
+
+    walk(root, "", 1)
+    label_width = max((len(row.label) for row in rows), default=0)
+    shape_width = max((len(row.shape) for row in rows if row.shape is not None), default=0)
+    dtype_width = max((len(row.dtype) for row in rows if row.dtype is not None), default=0)
+    size_width = max((len(row.size) for row in rows if row.size is not None), default=0)
+    percent_width = max((len(row.percent) for row in rows if row.percent is not None), default=0)
+
+    lines: List[str] = []
+    for row in rows:
+        if row.shape is None:
+            lines.append(paint_label(row.label, has_tensor=False))
+        else:
+            label_cell = paint_label(row.label.ljust(label_width + 2), has_tensor=True)
+            shape_cell = paint_shape(row.shape) + (" " * (shape_width - len(row.shape) + 2))
+            dtype_cell = paint_dtype(row.dtype) + (" " * (dtype_width - len(row.dtype) + 2))
+            size_cell = (" " * (size_width - len(row.size))) + paint_size(row.size)
+            percent_cell = (" " * (percent_width - len(row.percent))) + paint_percent(row.percent)
+            lines.append(
+                f"{label_cell}"
+                f"{shape_cell}"
+                f"{dtype_cell}"
+                f"{size_cell}  "
+                f"{percent_cell}"
+            )
+    return lines
+
+
+def do_list(raw_repo: str, revision: str, filter_query: Optional[str]) -> int:
+    repo_id = normalize_repo_id(raw_repo)
+    api = HfApi()
+    now_epoch = int(time.time())
+    cached = load_metadata_cache(repo_id=repo_id, revision=revision)
+
+    # Skip remote revision checks for recently-validated cache entries.
+    if cached is not None and (now_epoch - cached.revision_checked_at_epoch) < REVISION_CHECK_TTL_SECONDS:
+        files, tensors = cached.files, cached.tensors
+    else:
+        remote_revision_id = get_remote_revision_id(api=api, repo_id=repo_id, revision=revision)
+
+        if cached is not None and cached.remote_revision_id == remote_revision_id:
+            files, tensors = cached.files, cached.tensors
+            save_metadata_cache(
+                repo_id=repo_id,
+                revision=revision,
+                remote_revision_id=remote_revision_id,
+                revision_checked_at_epoch=now_epoch,
+                files=files,
+                tensors=tensors,
+            )
+        else:
+            files, _index_file = resolve_safetensor_files(api=api, repo_id=repo_id, revision=revision)
+            tensors = collect_tensors(repo_id=repo_id, files=files, revision=revision)
+            save_metadata_cache(
+                repo_id=repo_id,
+                revision=revision,
+                remote_revision_id=remote_revision_id,
+                revision_checked_at_epoch=now_epoch,
+                files=files,
+                tensors=tensors,
+            )
+
+    trie = build_trie(tensors)
+    trie = filter_trie(trie, filter_query)
+
+    total_bytes = sum(tensor.nbytes for tensor in tensors.values())
+    file_word = "file" if len(files) == 1 else "files"
+    tensor_word = "tensor" if len(tensors) == 1 else "tensors"
+    print(
+        f"{paint(repo_id, COLOR_WHITE)} {paint_dark(f'({revision})')}"
+        f"{paint_dark(' - ')}"
+        f"{len(files)} {paint_dark(file_word)}"
+        f"{paint_dark(', ')}"
+        f"{len(tensors)} {paint_dark(tensor_word)}"
+        f"{paint_dark(', ')}"
+        f"{paint_total_size(format_bytes(total_bytes))}"
+    )
+
+    for line in render_tree(trie, total_bytes=total_bytes):
+        print(line)
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    repo_arg = args.list_repo if args.list_repo else args.repo
+    if not repo_arg:
+        print("usage: we <HF_URL_OR_REPO> [FILTER_QUERY] [--revision REVISION]", file=sys.stderr)
+        return 2
+
+    filter_query = " ".join(args.filter_query).strip()
+    if not filter_query:
+        filter_query = None
+
+    try:
+        return do_list(raw_repo=repo_arg, revision=args.revision, filter_query=filter_query)
+    except (ValueError, RuntimeError, HfHubHTTPError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
