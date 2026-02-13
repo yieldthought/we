@@ -12,10 +12,10 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-from huggingface_hub import HfApi, HfFileSystem, hf_hub_download
+from huggingface_hub import HfApi, HfFileSystem, get_token, hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError, disable_progress_bars
 
 
@@ -42,8 +42,7 @@ class DisplayRow:
     min_value: Optional[str] = None
     mean_value: Optional[str] = None
     max_value: Optional[str] = None
-    pcc: Optional[str] = None
-    atol: Optional[str] = None
+    compression_metrics: Dict[str, Tuple[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -77,6 +76,7 @@ class SourceState:
     local_base_dir: Optional[Path]
     repo_id: Optional[str]
     revision: Optional[str]
+    hf_token: Optional[str]
 
 
 def supports_color() -> bool:
@@ -106,6 +106,13 @@ COLOR_ATOL_DARK = 68
 
 CACHE_SCHEMA_VERSION = 2
 REVISION_CHECK_TTL_SECONDS = 3600
+
+SUPPORTED_COMPRESS_FORMATS = ["bfp8", "bfp4"]
+COMPRESS_FORMAT_TO_TTNN_DTYPE = {
+    "bfp8": "bfloat8_b",
+    "bfp4": "bfloat4_b",
+}
+COMPRESS_ALL_TOKEN = "all"
 
 
 def paint(text: str, color_code: int) -> str:
@@ -230,10 +237,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-c",
         "--compress",
-        choices=["bfp8"],
-        help="Optional host-side compression round-trip to run on matched tensors.",
+        action="append",
+        choices=SUPPORTED_COMPRESS_FORMATS + [COMPRESS_ALL_TOKEN],
+        type=str.lower,
+        metavar="FORMAT",
+        help=(
+            "Optional host-side compression round-trip to run on matched tensors. "
+            "Repeat for multiple formats (e.g. -c bfp8 -c bfp4). "
+            "Use -c all to run all supported formats."
+        ),
     )
     return parser.parse_args()
+
+
+def resolve_compress_formats(raw_values: Optional[List[str]]) -> List[str]:
+    if not raw_values:
+        return []
+
+    seen: Set[str] = set()
+    resolved: List[str] = []
+
+    def add_once(format_name: str) -> None:
+        if format_name not in seen:
+            seen.add(format_name)
+            resolved.append(format_name)
+
+    for raw_value in raw_values:
+        value = raw_value.strip().lower()
+        if value == COMPRESS_ALL_TOKEN:
+            for supported in SUPPORTED_COMPRESS_FORMATS:
+                add_once(supported)
+            continue
+
+        if value not in COMPRESS_FORMAT_TO_TTNN_DTYPE:
+            supported = ", ".join(SUPPORTED_COMPRESS_FORMATS)
+            raise ValueError(f"Unsupported compression format '{raw_value}'. Supported formats: {supported}")
+        add_once(value)
+
+    return resolved
+
+
+def resolve_hf_token() -> Optional[str]:
+    env_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if env_token:
+        stripped = env_token.strip()
+        if stripped:
+            return stripped
+    cached_token = get_token()
+    if isinstance(cached_token, str):
+        stripped = cached_token.strip()
+        if stripped:
+            return stripped
+    return None
 
 
 def normalize_repo_id(raw_value: str) -> str:
@@ -446,14 +501,14 @@ def normalize_weight_map(raw_weight_map: object, context_name: str) -> Dict[str,
 
 
 def resolve_safetensor_files(
-    api: HfApi, repo_id: str, revision: str
+    api: HfApi, repo_id: str, revision: str, hf_token: Optional[str]
 ) -> Tuple[List[str], Optional[str], Optional[Dict[str, str]]]:
     files = api.list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
 
     index_files = sorted(name for name in files if name.endswith(".safetensors.index.json"))
     if index_files:
         preferred_index = "model.safetensors.index.json" if "model.safetensors.index.json" in index_files else index_files[0]
-        fs = HfFileSystem()
+        fs = HfFileSystem(token=hf_token)
         with fs.open(f"{repo_id}/{preferred_index}", "rb", revision=revision) as handle:
             index_data = json.load(handle)
         normalized_weight_map = normalize_weight_map(
@@ -564,8 +619,10 @@ def estimate_nbytes(shape: Iterable[int], dtype: str) -> int:
     return count * item_size
 
 
-def collect_tensors(repo_id: str, files: List[str], revision: str) -> Tuple[Dict[str, TensorInfo], Dict[str, str]]:
-    fs = HfFileSystem()
+def collect_tensors(
+    repo_id: str, files: List[str], revision: str, hf_token: Optional[str]
+) -> Tuple[Dict[str, TensorInfo], Dict[str, str]]:
+    fs = HfFileSystem(token=hf_token)
     tensors: Dict[str, TensorInfo] = {}
     tensor_files: Dict[str, str] = {}
 
@@ -878,13 +935,14 @@ def import_ttnn_quiet():
     return ttnn
 
 
-def run_bfp8_compression(
+def run_compressions(
     source: SourceState,
     tensor_names: List[str],
     tensors: Dict[str, TensorInfo],
     tensor_files: Dict[str, str],
-) -> Dict[str, TensorCompressionStats]:
-    if not tensor_names:
+    compress_formats: List[str],
+) -> Dict[str, Dict[str, TensorCompressionStats]]:
+    if not tensor_names or not compress_formats:
         return {}
 
     import torch  # pylint: disable=import-outside-toplevel
@@ -893,6 +951,14 @@ def run_bfp8_compression(
 
     disable_progress_bars()
     ttnn = import_ttnn_quiet()
+    ttnn_dtypes: Dict[str, object] = {}
+    for format_name in compress_formats:
+        dtype_attr = COMPRESS_FORMAT_TO_TTNN_DTYPE.get(format_name)
+        if dtype_attr is None:
+            raise RuntimeError(f"Unsupported compression format: {format_name}")
+        if not hasattr(ttnn, dtype_attr):
+            raise RuntimeError(f"Active ttnn does not support compression format '{format_name}'.")
+        ttnn_dtypes[format_name] = getattr(ttnn, dtype_attr)
 
     names_by_file: Dict[str, List[str]] = {}
     total_bytes = 0
@@ -908,14 +974,16 @@ def run_bfp8_compression(
 
     if not names_by_file:
         return {}
+    total_bytes *= len(compress_formats)
 
-    stats_by_tensor: Dict[str, TensorCompressionStats] = {}
+    stats_by_format: Dict[str, Dict[str, TensorCompressionStats]] = {name: {} for name in compress_formats}
+    progress_desc = compress_formats[0] if len(compress_formats) == 1 else ",".join(compress_formats)
     with tqdm(
         total=total_bytes,
         unit="B",
         unit_scale=True,
         unit_divisor=1000,
-        desc="bfp8",
+        desc=progress_desc,
         dynamic_ncols=True,
         leave=True,
     ) as progress:
@@ -932,38 +1000,42 @@ def run_bfp8_compression(
                     filename=filename,
                     repo_type="model",
                     revision=source.revision,
+                    token=source.hf_token,
                 )
             with safe_open(local_path, framework="pt", device="cpu") as handle:
                 for tensor_name in sorted(names_by_file[filename], key=natural_sort_key):
                     tensor_info = tensors[tensor_name]
                     original = handle.get_tensor(tensor_name)
                     original_fp32 = original.to(dtype=torch.float32)
-                    tt_tensor = ttnn.from_torch(
-                        original_fp32,
-                        dtype=ttnn.bfloat8_b,
-                        layout=ttnn.TILE_LAYOUT,
-                    )
-                    roundtrip_fp32 = ttnn.to_torch(tt_tensor).to(dtype=torch.float32)
-
-                    stats_by_tensor[tensor_name] = compute_compression_stats(original_fp32, roundtrip_fp32)
-                    progress.update(tensor_info.nbytes)
-
-                    del tt_tensor
-                    del roundtrip_fp32
+                    for format_name in compress_formats:
+                        tt_tensor = ttnn.from_torch(
+                            original_fp32,
+                            dtype=ttnn_dtypes[format_name],
+                            layout=ttnn.TILE_LAYOUT,
+                        )
+                        roundtrip_fp32 = ttnn.to_torch(tt_tensor).to(dtype=torch.float32)
+                        stats_by_format[format_name][tensor_name] = compute_compression_stats(original_fp32, roundtrip_fp32)
+                        progress.update(tensor_info.nbytes)
+                        del tt_tensor
+                        del roundtrip_fp32
                     del original_fp32
                     del original
 
-    return stats_by_tensor
+    return stats_by_format
 
 
 def render_tree(
     root: TrieNode,
     total_bytes: int,
-    compression_stats: Optional[Dict[str, TensorCompressionStats]] = None,
+    compression_formats: Optional[List[str]] = None,
+    compression_stats: Optional[Dict[str, Dict[str, TensorCompressionStats]]] = None,
 ) -> List[str]:
+    compression_formats = compression_formats or []
+    compression_stats = compression_stats or {}
+
     rows: List[DisplayRow] = []
     signature_cache: Dict[int, object] = {}
-    include_compression = compression_stats is not None
+    include_compression = bool(compression_formats)
 
     def join_path(prefix: str, child: str) -> str:
         return f"{prefix}.{child}" if prefix else child
@@ -979,19 +1051,27 @@ def render_tree(
             percent=format_percent(percent),
         )
         if include_compression:
-            matched_stats = [compression_stats[path] for path in tensor_paths if path in compression_stats]
-            if matched_stats:
-                min_value = min(stat.min_val for stat in matched_stats)
-                mean_value = sum(stat.mean_val for stat in matched_stats) / len(matched_stats)
-                max_value = max(stat.max_val for stat in matched_stats)
+            summary_stats: Optional[List[TensorCompressionStats]] = None
+            for format_name in compression_formats:
+                stats_for_format = compression_stats.get(format_name, {})
+                matched_stats = [stats_for_format[path] for path in tensor_paths if path in stats_for_format]
+                if not matched_stats:
+                    continue
+
+                if summary_stats is None:
+                    summary_stats = matched_stats
+
                 worst_pcc = min(stat.pcc for stat in matched_stats)
                 worst_atol = max(stat.atol for stat in matched_stats)
+                row.compression_metrics[format_name] = (f"{worst_pcc:.4f}", format_scientific(worst_atol))
 
+            if summary_stats:
+                min_value = min(stat.min_val for stat in summary_stats)
+                mean_value = sum(stat.mean_val for stat in summary_stats) / len(summary_stats)
+                max_value = max(stat.max_val for stat in summary_stats)
                 row.min_value = format_two_dp(min_value)
                 row.mean_value = format_two_dp(mean_value)
                 row.max_value = format_two_dp(max_value)
-                row.pcc = f"{worst_pcc:.4f}"
-                row.atol = format_scientific(worst_atol)
         rows.append(row)
 
     def walk(node: TrieNode, indent: str, multiplier: int, path_prefixes: List[str]) -> None:
@@ -1087,11 +1167,21 @@ def render_tree(
     dtype_width = max((len(row.dtype) for row in rows if row.dtype is not None), default=0)
     size_width = max((len(row.size) for row in rows if row.size is not None), default=0)
     percent_width = max((len(row.percent) for row in rows if row.percent is not None), default=0)
-    min_width = max((len((row.min_value or "-")) for row in rows if row.shape is not None), default=0)
-    mean_width = max((len((row.mean_value or "-")) for row in rows if row.shape is not None), default=0)
-    max_width = max((len((row.max_value or "-")) for row in rows if row.shape is not None), default=0)
-    pcc_width = max((len((row.pcc or "-")) for row in rows if row.shape is not None), default=0)
-    atol_width = max((len((row.atol or "-")) for row in rows if row.shape is not None), default=0)
+    min_width = max((len((row.min_value or "-")) for row in rows if row.shape is not None), default=1)
+    mean_width = max((len((row.mean_value or "-")) for row in rows if row.shape is not None), default=1)
+    max_width = max((len((row.max_value or "-")) for row in rows if row.shape is not None), default=1)
+    pcc_widths: Dict[str, int] = {}
+    atol_widths: Dict[str, int] = {}
+    if include_compression:
+        for format_name in compression_formats:
+            pcc_widths[format_name] = max(
+                (len(row.compression_metrics.get(format_name, ("-", "-"))[0]) for row in rows if row.shape is not None),
+                default=1,
+            )
+            atol_widths[format_name] = max(
+                (len(row.compression_metrics.get(format_name, ("-", "-"))[1]) for row in rows if row.shape is not None),
+                default=1,
+            )
 
     lines: List[str] = []
     for row in rows:
@@ -1114,22 +1204,26 @@ def render_tree(
                 min_cell = paint_scientific_e((row.min_value or "-").rjust(min_width))
                 mean_cell = paint_scientific_e((row.mean_value or "-").rjust(mean_width))
                 max_cell = paint_scientific_e((row.max_value or "-").rjust(max_width))
-                pcc_cell = paint_metric_number((row.pcc or "-").rjust(pcc_width), COLOR_PCC)
-                atol_cell = paint_scientific_metric(
-                    (row.atol or "-").rjust(atol_width), COLOR_ATOL, COLOR_ATOL_DARK
-                )
                 lines[-1] += (
                     f"{paint_dark('  |  ')}"
                     f"{min_cell}{paint_dark(' ≤ ')}{mean_cell}{paint_dark(' ≤ ')}{max_cell}"
-                    f"{paint_dark('  |  ')}"
-                    f"{paint_dark('bfp8  ')}"
-                    f"{pcc_cell}{paint_dark(' pcc')}  "
-                    f"{atol_cell}{paint_dark(' atol')}"
                 )
+                for format_name in compression_formats:
+                    pcc_text, atol_text = row.compression_metrics.get(format_name, ("-", "-"))
+                    pcc_cell = paint_metric_number(pcc_text.rjust(pcc_widths[format_name]), COLOR_PCC)
+                    atol_cell = paint_scientific_metric(
+                        atol_text.rjust(atol_widths[format_name]), COLOR_ATOL, COLOR_ATOL_DARK
+                    )
+                    lines[-1] += (
+                        f"{paint_dark('  |  ')}"
+                        f"{paint_dark(f'{format_name}  ')}"
+                        f"{pcc_cell}{paint_dark(' pcc')}  "
+                        f"{atol_cell}{paint_dark(' atol')}"
+                    )
     return lines
 
 
-def do_list(raw_repo: str, revision: str, filter_query: Optional[str], compress: Optional[str]) -> int:
+def do_list(raw_repo: str, revision: str, filter_query: Optional[str], compress_formats: List[str]) -> int:
     local_candidate = Path(raw_repo).expanduser()
     if local_candidate.exists():
         local_base_dir, files, _weight_map = resolve_local_safetensor_files(local_candidate)
@@ -1140,10 +1234,12 @@ def do_list(raw_repo: str, revision: str, filter_query: Optional[str], compress:
             local_base_dir=local_base_dir,
             repo_id=None,
             revision=None,
+            hf_token=None,
         )
     else:
         repo_id = normalize_repo_id(raw_repo)
-        api = HfApi()
+        hf_token = resolve_hf_token()
+        api = HfApi(token=hf_token)
         now_epoch = int(time.time())
         cached = load_metadata_cache(repo_id=repo_id, revision=revision)
 
@@ -1165,8 +1261,12 @@ def do_list(raw_repo: str, revision: str, filter_query: Optional[str], compress:
                     tensor_files=tensor_files,
                 )
             else:
-                files, _index_file, _weight_map = resolve_safetensor_files(api=api, repo_id=repo_id, revision=revision)
-                tensors, tensor_files = collect_tensors(repo_id=repo_id, files=files, revision=revision)
+                files, _index_file, _weight_map = resolve_safetensor_files(
+                    api=api, repo_id=repo_id, revision=revision, hf_token=hf_token
+                )
+                tensors, tensor_files = collect_tensors(
+                    repo_id=repo_id, files=files, revision=revision, hf_token=hf_token
+                )
                 save_metadata_cache(
                     repo_id=repo_id,
                     revision=revision,
@@ -1183,19 +1283,21 @@ def do_list(raw_repo: str, revision: str, filter_query: Optional[str], compress:
             local_base_dir=None,
             repo_id=repo_id,
             revision=revision,
+            hf_token=hf_token,
         )
 
     trie = build_trie(tensors)
     trie = filter_trie(trie, filter_query)
 
-    compression_stats: Optional[Dict[str, TensorCompressionStats]] = None
-    if compress == "bfp8":
+    compression_stats: Optional[Dict[str, Dict[str, TensorCompressionStats]]] = None
+    if compress_formats:
         tensor_names = collect_tensor_names(trie)
-        compression_stats = run_bfp8_compression(
+        compression_stats = run_compressions(
             source=source,
             tensor_names=tensor_names,
             tensors=tensors,
             tensor_files=tensor_files,
+            compress_formats=compress_formats,
         )
 
     total_bytes = sum(tensor.nbytes for tensor in tensors.values())
@@ -1212,7 +1314,12 @@ def do_list(raw_repo: str, revision: str, filter_query: Optional[str], compress:
         f"{paint_total_size(format_bytes(total_bytes))}"
     )
 
-    for line in render_tree(trie, total_bytes=total_bytes, compression_stats=compression_stats):
+    for line in render_tree(
+        trie,
+        total_bytes=total_bytes,
+        compression_formats=compress_formats,
+        compression_stats=compression_stats,
+    ):
         print(line)
     return 0
 
@@ -1221,7 +1328,7 @@ def main() -> int:
     args = parse_args()
     repo_arg = args.list_repo if args.list_repo else args.repo
     if not repo_arg:
-        print("usage: we <HF_URL_OR_REPO> [FILTER_QUERY] [--revision REVISION] [-c bfp8]", file=sys.stderr)
+        print("usage: we <HF_URL_OR_REPO> [FILTER_QUERY] [--revision REVISION] [-c [FORMAT]]", file=sys.stderr)
         return 2
 
     filter_query = " ".join(args.filter_query).strip()
@@ -1229,7 +1336,13 @@ def main() -> int:
         filter_query = None
 
     try:
-        return do_list(raw_repo=repo_arg, revision=args.revision, filter_query=filter_query, compress=args.compress)
+        compress_formats = resolve_compress_formats(args.compress)
+        return do_list(
+            raw_repo=repo_arg,
+            revision=args.revision,
+            filter_query=filter_query,
+            compress_formats=compress_formats,
+        )
     except (ValueError, RuntimeError, HfHubHTTPError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

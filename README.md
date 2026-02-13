@@ -23,7 +23,7 @@ Run the tool:
 ## Usage
 
 ```bash
-we [repo_or_url] [filter_query] [--revision REVISION] [-c bfp8]
+we [repo_or_url] [filter_query] [--revision REVISION] [-c FORMAT]
 ```
 
 Examples:
@@ -49,6 +49,12 @@ Examples:
 
 # Run host-side bfp8 round-trip + quality metrics on matched tensors
 ./we Qwen/Qwen3-0.6B model.layers.1.self_attn -c bfp8
+
+# Run bfp8 and bfp4 in explicit order
+./we Qwen/Qwen3-0.6B model.layers.1.self_attn -c bfp8 -c bfp4
+
+# Explicitly run all supported compression formats
+./we Qwen/Qwen3-0.6B model.layers.1.self_attn -c all
 ```
 
 ## Output Notes
@@ -57,7 +63,8 @@ Examples:
 - Mixed structures (for example early dense layers then MoE layers) collapse by contiguous matching runs.
 - F8 pair pattern (`weight` + `weight_scale_inv`) is rendered as a single logical row and hides `weight_scale_inv`.
 - Percentages account for collapsed multiplicity (so `%` reflects true total contribution).
-- `-c bfp8` adds ` | <min> ≤ <mean> ≤ <max> | bfp8  <pcc> pcc <atol> atol` after the size/% columns.
+- `-c [FORMAT]` appends ` | <min> ≤ <mean> ≤ <max> | <format>  <pcc> pcc <atol> atol` blocks after the size/% columns.
+- Supported formats today: `bfp8`, `bfp4`. Repeat `-c` for multiple formats; use `-c all` to run all.
 - Compression only downloads the shard files that contain matched tensors (file-level granularity, via HF cache).
 
 ## Caching
