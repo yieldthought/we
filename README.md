@@ -1,6 +1,6 @@
 # we
 
-`we` is a small, terminal-first model weight viewer for Hugging Face checkpoints.
+A small model weight viewer for Hugging Face checkpoints that avoids downloading too much.
 
 <p align="center">
   <img src="docs/assets/deepseek_example.png" alt="Screenshot of we listing DeepSeek-R1 tensors" width="542" />
