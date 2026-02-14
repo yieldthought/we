@@ -4,7 +4,7 @@
   <img src="docs/assets/deepseek_example.png" alt="Screenshot of we listing DeepSeek-R1 tensors" width="542" />
 </p>
 
-Today it focuses on model introspection. Next steps are compression experiments (TTNN `bfp8`/`bfp4`/`bfp2`) and quality metrics (`pcc`, `atol`) against original weights.
+Great for model introspection and compression experiments (TTNN `bfp8`/`bfp4`) showing quality metrics (`pcc`, `atol`) against original weights.
 
 ## Quick Start
 
@@ -46,7 +46,11 @@ Examples:
 
 # Specific branch/tag/commit
 ./we Qwen/Qwen3-0.6B --revision main
+```
 
+Examples with compression evaluation (downloads required weights):
+
+```bash
 # Run host-side bfp8 round-trip + quality metrics on matched tensors
 ./we Qwen/Qwen3-0.6B model.layers.1.self_attn -c bfp8
 
