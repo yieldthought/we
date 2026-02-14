@@ -53,6 +53,9 @@ Examples:
 # Run bfp8 and bfp4 in explicit order
 ./we Qwen/Qwen3-0.6B model.layers.1.self_attn -c bfp8 -c bfp4
 
+# Run transposed-input formats
+./we Qwen/Qwen3-0.6B model.layers.1.self_attn -c bfp8.T -c bfp4.T
+
 # Explicitly run all supported compression formats
 ./we Qwen/Qwen3-0.6B model.layers.1.self_attn -c all
 ```
@@ -64,7 +67,7 @@ Examples:
 - F8 pair pattern (`weight` + `weight_scale_inv`) is rendered as a single logical row and hides `weight_scale_inv`.
 - Percentages account for collapsed multiplicity (so `%` reflects true total contribution).
 - `-c [FORMAT]` appends ` | <min> ≤ <mean> ≤ <max> | <format>  <pcc> pcc <atol> atol` blocks after the size/% columns.
-- Supported formats today: `bfp8`, `bfp4`. Repeat `-c` for multiple formats; use `-c all` to run all.
+- Supported formats today: `bfp8`, `bfp8.T`, `bfp4`, `bfp4.T`. Repeat `-c` for multiple formats; use `-c all` to run all.
 - Compression only downloads the shard files that contain matched tensors (file-level granularity, via HF cache).
 
 ## Caching

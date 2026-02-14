@@ -107,11 +107,14 @@ COLOR_ATOL_DARK = 68
 CACHE_SCHEMA_VERSION = 2
 REVISION_CHECK_TTL_SECONDS = 3600
 
-SUPPORTED_COMPRESS_FORMATS = ["bfp8", "bfp4"]
-COMPRESS_FORMAT_TO_TTNN_DTYPE = {
-    "bfp8": "bfloat8_b",
-    "bfp4": "bfloat4_b",
+COMPRESS_FORMAT_SPECS = {
+    "bfp8": {"dtype_attr": "bfloat8_b", "transpose_before_compress": False},
+    "bfp8.T": {"dtype_attr": "bfloat8_b", "transpose_before_compress": True},
+    "bfp4": {"dtype_attr": "bfloat4_b", "transpose_before_compress": False},
+    "bfp4.T": {"dtype_attr": "bfloat4_b", "transpose_before_compress": True},
 }
+SUPPORTED_COMPRESS_FORMATS = list(COMPRESS_FORMAT_SPECS.keys())
+COMPRESS_FORMAT_ALIASES = {format_name.lower(): format_name for format_name in SUPPORTED_COMPRESS_FORMATS}
 COMPRESS_ALL_TOKEN = "all"
 
 
@@ -238,12 +241,10 @@ def parse_args() -> argparse.Namespace:
         "-c",
         "--compress",
         action="append",
-        choices=SUPPORTED_COMPRESS_FORMATS + [COMPRESS_ALL_TOKEN],
-        type=str.lower,
         metavar="FORMAT",
         help=(
             "Optional host-side compression round-trip to run on matched tensors. "
-            "Repeat for multiple formats (e.g. -c bfp8 -c bfp4). "
+            "Repeat for multiple formats (e.g. -c bfp8 -c bfp4.T). "
             "Use -c all to run all supported formats."
         ),
     )
@@ -263,16 +264,18 @@ def resolve_compress_formats(raw_values: Optional[List[str]]) -> List[str]:
             resolved.append(format_name)
 
     for raw_value in raw_values:
-        value = raw_value.strip().lower()
-        if value == COMPRESS_ALL_TOKEN:
+        value = raw_value.strip()
+        lowered = value.lower()
+        if lowered == COMPRESS_ALL_TOKEN:
             for supported in SUPPORTED_COMPRESS_FORMATS:
                 add_once(supported)
             continue
 
-        if value not in COMPRESS_FORMAT_TO_TTNN_DTYPE:
+        canonical = COMPRESS_FORMAT_ALIASES.get(lowered)
+        if canonical is None:
             supported = ", ".join(SUPPORTED_COMPRESS_FORMATS)
             raise ValueError(f"Unsupported compression format '{raw_value}'. Supported formats: {supported}")
-        add_once(value)
+        add_once(canonical)
 
     return resolved
 
@@ -951,14 +954,16 @@ def run_compressions(
 
     disable_progress_bars()
     ttnn = import_ttnn_quiet()
-    ttnn_dtypes: Dict[str, object] = {}
+    format_runtime: Dict[str, Tuple[object, bool]] = {}
     for format_name in compress_formats:
-        dtype_attr = COMPRESS_FORMAT_TO_TTNN_DTYPE.get(format_name)
-        if dtype_attr is None:
+        format_spec = COMPRESS_FORMAT_SPECS.get(format_name)
+        if format_spec is None:
             raise RuntimeError(f"Unsupported compression format: {format_name}")
+        dtype_attr = str(format_spec["dtype_attr"])
+        transpose_before_compress = bool(format_spec["transpose_before_compress"])
         if not hasattr(ttnn, dtype_attr):
             raise RuntimeError(f"Active ttnn does not support compression format '{format_name}'.")
-        ttnn_dtypes[format_name] = getattr(ttnn, dtype_attr)
+        format_runtime[format_name] = (getattr(ttnn, dtype_attr), transpose_before_compress)
 
     names_by_file: Dict[str, List[str]] = {}
     total_bytes = 0
@@ -1008,14 +1013,22 @@ def run_compressions(
                     original = handle.get_tensor(tensor_name)
                     original_fp32 = original.to(dtype=torch.float32)
                     for format_name in compress_formats:
+                        ttnn_dtype, transpose_before_compress = format_runtime[format_name]
+                        compression_input = original_fp32
+                        if transpose_before_compress and original_fp32.ndim >= 2:
+                            compression_input = original_fp32.transpose(-2, -1).contiguous()
                         tt_tensor = ttnn.from_torch(
-                            original_fp32,
-                            dtype=ttnn_dtypes[format_name],
+                            compression_input,
+                            dtype=ttnn_dtype,
                             layout=ttnn.TILE_LAYOUT,
                         )
                         roundtrip_fp32 = ttnn.to_torch(tt_tensor).to(dtype=torch.float32)
+                        if transpose_before_compress and original_fp32.ndim >= 2:
+                            roundtrip_fp32 = roundtrip_fp32.transpose(-2, -1).contiguous()
                         stats_by_format[format_name][tensor_name] = compute_compression_stats(original_fp32, roundtrip_fp32)
                         progress.update(tensor_info.nbytes)
+                        if compression_input is not original_fp32:
+                            del compression_input
                         del tt_tensor
                         del roundtrip_fp32
                     del original_fp32
@@ -1328,7 +1341,7 @@ def main() -> int:
     args = parse_args()
     repo_arg = args.list_repo if args.list_repo else args.repo
     if not repo_arg:
-        print("usage: we <HF_URL_OR_REPO> [FILTER_QUERY] [--revision REVISION] [-c [FORMAT]]", file=sys.stderr)
+        print("usage: we <HF_URL_OR_REPO> [FILTER_QUERY] [--revision REVISION] [-c FORMAT]", file=sys.stderr)
         return 2
 
     filter_query = " ".join(args.filter_query).strip()
